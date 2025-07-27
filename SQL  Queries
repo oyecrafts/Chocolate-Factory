@@ -1,0 +1,412 @@
+
+CREATE OR REPLACE TABLE `candy-factory-operations.factory_ops.cleaned_sales_df` AS
+SELECT *
+FROM (
+  SELECT *,
+         ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY order_date DESC) AS rn
+  FROM `candy-factory-operations.factory_ops.sales_df`
+)
+WHERE rn = 1;
+
+
+SELECT
+  ARRAY(SELECT AS STRUCT column_name FROM UNNEST(REGEXP_EXTRACT_ALL(TO_JSON_STRING(t), r'"(\w+)":null')) AS column_name) AS null_columns
+FROM `candy-factory-operations.factory_ops.sales_df` AS t
+LIMIT 10;
+
+
+SELECT column_name
+FROM `candy-factory-operations.factory_ops.INFORMATION_SCHEMA.COLUMNS`
+WHERE table_name = 'sales_df';
+
+
+
+CREATE OR REPLACE TABLE `candy-factory-operations.factory_ops.cleaned_sales_df` AS
+SELECT
+  *,
+  Target / 1000 AS Target_Adjusted
+FROM
+  `candy-factory-operations.factory_ops.cleaned_sales_df`;
+
+CREATE OR REPLACE TABLE `candy-factory-operations.factory_ops.cleaned_sales_df` AS
+SELECT 
+  * EXCEPT(Ship_Date, product_id, rn, row_id, Target),
+  DATE_DIFF(SAFE_CAST(Ship_Date_Transformed AS DATE), SAFE_CAST(Order_Date AS DATE), DAY) AS shipping_delay,
+   EXTRACT(DAYOFWEEK FROM SAFE_CAST(Order_Date AS DATE)) AS Order_Day_Of_Week,
+  EXTRACT(MONTH FROM SAFE_CAST(Order_Date AS DATE)) AS Order_Month,
+  EXTRACT(YEAR FROM SAFE_CAST(Order_Date AS DATE)) AS Order_Year,
+  (Gross_Profit / Sales) AS Profit_Margin,
+  Sales / Units AS Sales_Per_Unit,
+  LOG(Sales) AS Log_Sales,
+  (Gross_Profit / Cost) AS Gross_Profit_Margin
+FROM 
+  `candy-factory-operations.factory_ops.cleaned_sales_df`;
+
+
+  -- Seasonality
+  
+CREATE OR REPLACE TABLE `candy-factory-operations.factory_ops.cleaned_sales_df` AS
+SELECT *,
+  CASE
+    WHEN EXTRACT(MONTH FROM SAFE_CAST(Order_Date AS DATE)) IN (11, 12) THEN 'Holiday Season'
+    WHEN EXTRACT(MONTH FROM SAFE_CAST(Order_Date AS DATE)) BETWEEN 6 AND 8 THEN 'Summer Season'
+    ELSE 'Other'
+  END AS Seasonality_Feature
+
+FROM 
+  `candy-factory-operations.factory_ops.cleaned_sales_df`;
+
+
+CREATE OR REPLACE TABLE `candy-factory-operations.factory_ops.sales_predictions` AS
+SELECT
+  Sales AS actual_sales,
+  predicted_Sales AS predicted_sales
+FROM
+  ML.PREDICT(
+    MODEL `candy-factory-operations.factory_ops.sales_prediction_model`,
+    (
+      SELECT
+        Sales,
+        shipping_delay,
+        Order_Day_Of_Week,
+        Order_Month,
+        Order_Year,
+        Profit_Margin,
+        Sales_Per_Unit,
+        Log_Sales,
+        Gross_Profit_Margin,
+        Ship_Mode,
+        Country_Region,
+        Division,
+        Region,
+        Product_Name,
+        Factory,
+        Seasonality_Feature
+      FROM
+        `candy-factory-operations.factory_ops.cleaned_sales_df`
+      WHERE
+        Sales IS NOT NULL
+    )
+  );
+
+CREATE OR REPLACE TABLE `candy-factory-operations.factory_ops.sales_predictions_filtered` AS
+SELECT *
+FROM `candy-factory-operations.factory_ops.sales_predictions`
+WHERE actual_sales IS NOT NULL
+  AND predicted_sales IS NOT NULL
+  AND actual_sales < 10000  -- filter out extreme values if needed
+  AND predicted_sales < 10000;
+
+
+
+
+  #cost analytics
+CREATE OR REPLACE TABLE `candy-factory-operations.factory_ops.cost_analytics_df` AS
+SELECT
+  Region,
+  Product_Name,
+  SUM(Cost) AS total_cost,
+  AVG(Cost) AS avg_cost,
+  SUM(Sales) AS total_sales,
+  AVG(Sales) AS avg_sales,
+  SUM(Units) AS total_units,
+  AVG(Units) AS avg_units,
+  AVG(shipping_delay) AS avg_shipping_delay,
+  COUNT(*) AS num_orders
+FROM
+  `candy-factory-operations.factory_ops.cleaned_sales_df`
+GROUP BY
+  Region,
+  Product_Name
+ORDER BY
+  total_cost DESC;
+#cost by shipping mode
+CREATE OR REPLACE TABLE `candy-factory-operations.factory_ops.cost_by_shipping_mode_df` AS
+SELECT
+  Ship_Mode,
+  SUM(Cost) AS total_cost,
+  AVG(Cost) AS avg_cost,
+  SUM(Sales) AS total_sales,
+  AVG(Sales) AS avg_sales,
+  SUM(Units) AS total_units,
+  AVG(shipping_delay) AS avg_shipping_delay
+FROM
+  `candy-factory-operations.factory_ops.cleaned_sales_df`
+GROUP BY
+  Ship_Mode
+ORDER BY
+  total_cost DESC;
+
+
+  #performance evaluation
+ CREATE OR REPLACE TABLE `candy-factory-operations.factory_ops.product_performance_df` AS
+WITH product_sales AS (
+  SELECT 
+    Product_Name,
+    Division,
+    Factory,
+    SUM(Sales_Per_Unit) AS total_sales_per_unit,
+    AVG(Sales_Per_Unit) AS avg_sales_per_unit,
+    COUNT(DISTINCT Order_ID) AS order_count,
+    AVG(shipping_delay) AS avg_shipping_delay
+  FROM 
+    `candy-factory-operations.factory_ops.cleaned_sales_df`
+  GROUP BY 
+    Product_Name, Division, Factory
+),
+avg_sales AS (
+  SELECT AVG(total_sales_per_unit) AS avg_total_sales_per_unit FROM product_sales
+)
+SELECT 
+  ps.Product_Name,
+  ps.Division,
+  ps.Factory,
+  ps.total_sales_per_unit,
+  ps.avg_sales_per_unit,
+  ps.order_count,
+  ps.avg_shipping_delay,
+  CASE
+    WHEN ps.total_sales_per_unit > avg.avg_total_sales_per_unit THEN 'Best-Seller'
+    ELSE 'Slow-Mover'
+  END AS product_category
+FROM 
+  product_sales ps,
+  avg_sales avg;
+
+#sales features
+CREATE OR REPLACE TABLE `candy-factory-operations.factory_ops.sales_features_df` AS
+WITH base_data AS (
+  SELECT 
+    Order_Date,
+    Region,
+    Customer_ID,
+    Product_Name,
+    Sales,
+    Units,
+    Gross_Profit,
+    Cost,
+    Seasonality_Feature,
+    SUM(Sales) OVER (PARTITION BY Product_Name ORDER BY Order_Date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS Rolling_30_Day_Sales,
+    MAX(Order_Date) OVER (PARTITION BY Customer_ID, Product_Name) AS Last_Purchase_Date,
+    SUM(Sales) OVER (PARTITION BY Product_Name) AS Total_Product_Sales,
+    AVG(Sales) OVER (PARTITION BY Product_Name ORDER BY Order_Date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS Rolling_Sales_Avg
+  FROM 
+    `candy-factory-operations.factory_ops.cleaned_sales_df`
+),
+final_data AS (
+  SELECT *,
+    DATE_DIFF(Order_Date, Last_Purchase_Date, DAY) AS Time_Since_Last_Purchase,
+    DATE_DIFF(CURRENT_DATE(), Last_Purchase_Date, DAY) AS Recency
+  FROM base_data
+)
+SELECT * EXCEPT(Last_Purchase_Date)
+FROM final_data;
+
+
+CREATE OR REPLACE TABLE `candy-factory-operations.factory_ops.sales_features_df` AS
+SELECT 
+  *, 
+  CASE
+    WHEN Recency <= 30 THEN "0–30 days"
+    WHEN Recency <= 60 THEN "31–60 days"
+    WHEN Recency <= 90 THEN "61–90 days"
+    WHEN Recency <= 180 THEN "91–180 days"
+    WHEN Recency <= 365 THEN "181–365 days"
+    ELSE "Over 365 days"
+  END AS Recency_Bucket
+FROM
+  `candy-factory-operations.factory_ops.sales_features_df`;
+
+
+WITH sku_sales AS (
+  SELECT
+    Product_Name,
+    Product_Name AS SKU,
+    SUM(Sales) AS total_sales
+  FROM
+    `candy-factory-operations.factory_ops.cleaned_sales_df`
+  GROUP BY
+    Product_Name
+),
+ranked_skus AS (
+  SELECT
+    *,
+    total_sales / SUM(total_sales) OVER () AS sales_pct,
+    SUM(total_sales) OVER (ORDER BY total_sales DESC) / SUM(total_sales) OVER () AS cumulative_pct
+  FROM
+    sku_sales
+),
+classified_skus AS (
+  SELECT
+    *,
+    CASE
+      WHEN cumulative_pct <= 0.80 THEN 'A'
+      WHEN cumulative_pct <= 0.95 THEN 'B'
+      ELSE 'C'
+    END AS abc_class
+  FROM
+    ranked_skus
+)
+SELECT
+  SKU,
+  Product_Name,
+  total_sales,
+  ROUND(sales_pct * 100, 2) AS sales_percentage,
+  ROUND(cumulative_pct * 100, 2) AS cumulative_percentage,
+  abc_class
+FROM
+  classified_skus
+ORDER BY
+  total_sales DESC;
+
+
+
+-- Step 1: Aggregate sales and cost per product
+WITH sku_metrics AS (
+  SELECT
+    Product_Name,
+    SUM(Sales) AS total_sales,
+    SUM(Cost) AS total_cost,
+    SUM(Units) AS total_units,
+    SAFE_DIVIDE(SUM(Cost), NULLIF(SUM(Units), 0)) AS avg_cost_per_unit
+  FROM
+    `candy-factory-operations.factory_ops.cleaned_sales_df`
+  GROUP BY
+    Product_Name
+),
+
+-- Step 2: Calculate 85th percentile for cost, 20th for sales
+percentile_thresholds AS (
+  SELECT
+    APPROX_QUANTILES(avg_cost_per_unit, 100)[85] AS high_cost_threshold,
+    APPROX_QUANTILES(total_sales, 100)[20] AS low_sales_threshold
+  FROM
+    sku_metrics
+),
+
+-- Step 3: Filter based on thresholds
+filtered_skus AS (
+  SELECT
+    m.Product_Name,
+    m.total_sales,
+    m.total_units,
+    m.avg_cost_per_unit,
+    m.total_cost
+  FROM
+    sku_metrics m
+  CROSS JOIN
+    percentile_thresholds p
+  WHERE
+    m.avg_cost_per_unit >= p.high_cost_threshold
+    AND m.total_sales <= p.low_sales_threshold
+)
+
+-- Final result
+SELECT
+  Product_Name,
+  ROUND(total_sales, 2) AS total_sales,
+  total_units,
+  ROUND(avg_cost_per_unit, 2) AS avg_cost_per_unit,
+  ROUND(total_cost, 2) AS total_cost
+FROM
+  filtered_skus
+ORDER BY
+  avg_cost_per_unit DESC;
+
+
+
+
+WITH stats AS (
+  SELECT
+    MIN(f.sales) AS min_sales,
+    MAX(f.sales) AS max_sales,
+    MIN(f.shipping_delay) AS min_delay,
+    MAX(f.shipping_delay) AS max_delay
+  FROM `candy-factory-operations.factory_ops.cleaned_sales_df` f
+),
+
+normalized_scores AS (
+  SELECT
+    f.factory,
+    f.sales,
+    f.shipping_delay,
+
+    -- Normalize sales (higher is better)
+    (f.sales - s.min_sales) / NULLIF((s.max_sales - s.min_sales), 0) AS norm_sales,
+
+    -- Normalize delay (lower is better, so we invert it)
+    1 - ((f.shipping_delay - s.min_delay) / NULLIF((s.max_delay - s.min_delay), 0)) AS norm_delay
+
+  FROM `candy-factory-operations.factory_ops.cleaned_sales_df` f
+  CROSS JOIN stats s
+)
+
+SELECT
+  factory,
+  sales,
+  shipping_delay,
+  ROUND(norm_sales, 3) AS norm_sales,
+  ROUND(norm_delay, 3) AS norm_delay,
+
+  -- Composite score: 60% sales, 40% delay efficiency
+  ROUND((0.6 * norm_sales) + (0.4 * norm_delay), 3) AS integrated_score
+
+FROM normalized_scores
+ORDER BY integrated_score DESC;
+
+
+
+
+WITH stats AS (
+  SELECT
+    MIN(f.sales) AS min_sales,
+    MAX(f.sales) AS max_sales,
+    MIN(f.shipping_delay) AS min_delay,
+    MAX(f.shipping_delay) AS max_delay
+  FROM `candy-factory-operations.factory_ops.cleaned_sales_df` f
+),
+
+joined_data AS (
+  SELECT
+    f.factory,
+    f.product_name,
+    f.sales,
+    f.shipping_delay,
+    s.abc_class
+  FROM `candy-factory-operations.factory_ops.cleaned_sales_df` f
+  LEFT JOIN `candy-factory-operations.factory_ops.SKU` s
+    ON f.product_name = s.product_name
+),
+
+normalized_scores AS (
+  SELECT
+    jd.factory,
+    jd.product_name,
+    jd.abc_class,
+    jd.sales,
+    jd.shipping_delay,
+
+    -- Normalize sales
+    (jd.sales - st.min_sales) / NULLIF((st.max_sales - st.min_sales), 0) AS norm_sales,
+
+    -- Normalize delay (lower = better)
+    1 - ((jd.shipping_delay - st.min_delay) / NULLIF((st.max_delay - st.min_delay), 0)) AS norm_delay
+
+  FROM joined_data jd
+  CROSS JOIN stats st
+)
+
+SELECT
+  factory,
+  product_name,
+  abc_class,
+  sales,
+  shipping_delay,
+  ROUND(norm_sales, 3) AS norm_sales,
+  ROUND(norm_delay, 3) AS norm_delay,
+
+  -- Weighted score: 60% sales, 40% delivery efficiency
+  ROUND((0.6 * norm_sales) + (0.4 * norm_delay), 3) AS integrated_score
+
+FROM normalized_scores
+ORDER BY integrated_score DESC;
